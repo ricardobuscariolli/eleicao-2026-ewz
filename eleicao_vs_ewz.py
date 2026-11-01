@@ -226,6 +226,133 @@ def grafico(mk, ap, saida="eleicao_vs_ewz.png"):
     print("salvo em", saida)
 
 
+# ---------------------------------------------------------------- mercados de previsão (opcional)
+def carregar_previsao():
+    """Lê polymarket_1min.csv e kalshi_1min.csv (gerados por mercados_previsao.py), se existirem.
+    Devolve {fonte: Série de P(Lula vence)} com horário = FIM do minuto (mesma convenção da análise)."""
+    import os
+    out = {}
+    for fonte, arq, desloca in (("Polymarket", "polymarket_1min.csv", 0), ("Kalshi", "kalshi_1min.csv", 1)):
+        if not os.path.exists(arq):
+            continue
+        d = pd.read_csv(arq)
+        d["t"] = pd.to_datetime(d["t"]) + pd.Timedelta(minutes=desloca)   # Kalshi: candle -> fim do minuto
+        pv = d.pivot_table(index="t", columns="mercado", values="prob")
+        s = pv["Lula"].fillna(1 - pv["Flávio Bolsonaro"]) if "Flávio Bolsonaro" in pv else pv["Lula"]
+        if fonte == "Kalshi":   # no fechamento do mercado o livro esvazia e o ponto médio vira 50%: descarta
+            s = s[~((s - 0.5).abs() < 1e-9)]
+        out[fonte] = s.sort_index()
+    return out
+
+
+def grafico3(mk, ap, prev, saida="eleicao_vs_ewz_previsao.png"):
+    """Três painéis no mesmo eixo: EWZUSDT, P(Lula vence) nos mercados de previsão, apuração."""
+    mk = mk.assign(t=mk.t + pd.Timedelta(minutes=1))   # close do candle -> fim do minuto
+    base = mk.loc[mk.t <= FIM_VOTACAO, "close"].iloc[-1]
+    mk = mk.assign(ret=100 * (mk.close / base - 1))
+
+    VERMELHO, AZUL, CINZA, PRETO = "#C8102E", "#1F4E9C", "#6B7280", "#111827"
+    COR_PREV = {"Polymarket": "#6D28D9", "Kalshi": "#0F766E"}
+    plt.rcParams.update({"font.family": "DejaVu Sans", "axes.spines.top": False, "axes.spines.right": False})
+    fig, (a1, ap_, a2) = plt.subplots(3, 1, figsize=(10, 11.5), sharex=True,
+                                      gridspec_kw=dict(height_ratios=[1.15, 0.9, 0.9], hspace=0.22))
+
+    # --- painel 1: EWZUSDT
+    a1.plot(mk.t, mk.ret, color=PRETO, lw=1.4)
+    a1.axhline(0, color=CINZA, lw=0.8, ls=":")
+    a1.set_ylabel(f"{SIMBOLO} (Bybit)\nretorno desde 17h (%)")
+    a1.set_title("Eficiência de mercado em tempo real — 2º turno, 25/10/2026",
+                 loc="left", fontsize=14, fontweight="bold")
+
+    # --- painel 2: mercados de previsão
+    for fonte, s in prev.items():
+        s = s[(s.index >= INICIO) & (s.index <= FIM)]
+        ap_.plot(s.index, 100 * s.values, color=COR_PREV[fonte], lw=1.6,
+                 ls="-" if fonte == "Polymarket" else "--", label=fonte)
+    ap_.axhline(50, color=CINZA, lw=0.8, ls=":")
+    ap_.set_ylim(0, 100)
+    ap_.set_ylabel("P(Lula vence) (%)\nmercados de previsão")
+    ap_.set_title("Probabilidade implícita de vitória de Lula", loc="left", fontsize=10, color=PRETO)
+    ap_.legend(frameon=False, loc="lower right")
+    poly = prev.get("Polymarket")
+    if poly is not None:
+        p17 = poly[poly.index <= FIM_VOTACAO].iloc[-1]
+        ap_.text(FIM_VOTACAO + timedelta(minutes=3), 62,
+                 f"17h: {100 * p17:.0f}% para Lula\n(véspera: favoritismo de Flávio)",
+                 fontsize=8, color=COR_PREV["Polymarket"], va="bottom")
+        cruza = poly[(poly.index >= RETOMADA) & (poly > 0.5)]
+        if len(cruza):
+            tc = cruza.index[0]
+            depois = ap.loc[ap.t >= tc, "pct_urnas"]   # parciais só têm horário de notícia: dá um teto
+            u = f"\n(menos de {int(depois.iloc[0]) + 1}% das urnas)" if len(depois) else ""
+            ap_.axvline(tc, color=COR_PREV["Polymarket"], lw=1, ls=":")
+            ap_.text(tc - timedelta(minutes=2), 88, f"Lula vira favorito: {tc:%Hh%M}{u}",
+                     ha="right", va="center", fontsize=8, color=COR_PREV["Polymarket"],
+                     bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.9))
+
+    # --- painel 3: apuração
+    a2.plot(ap.t, ap.lula, color=VERMELHO, lw=2, marker="o", ms=3, label="Lula")
+    a2.plot(ap.t, ap.flavio, color=AZUL, lw=2, marker="o", ms=3, label="Flávio Bolsonaro")
+    a2.axhline(50, color=CINZA, lw=0.8, ls=":")
+    a2.set_ylabel("% dos votos válidos")
+    a2.set_title("Apuração do TSE", loc="left", fontsize=10, color=PRETO)
+    a2.legend(frameon=False, loc="upper right")
+    a3 = a2.twinx()
+    a3.fill_between(ap.t, ap.pct_urnas, color=CINZA, alpha=0.10, step="post")
+    a3.set_ylim(0, 100)
+    a3.set_ylabel("% de urnas apuradas (sombra)", color=CINZA)
+    a3.tick_params(colors=CINZA)
+    a3.spines["right"].set_visible(True)
+    a2.set_zorder(a3.get_zorder() + 1); a2.patch.set_visible(False)
+
+    # --- linhas verticais comuns
+    lider = (ap.lula > ap.flavio)
+    trocas = ap[lider != lider.shift()].iloc[1:]
+    for ax in (a1, ap_, a2):
+        ax.axvspan(FIM_VOTACAO, RETOMADA, color=CINZA, alpha=0.07, lw=0)
+        ax.axvline(RETOMADA, color=PRETO, lw=1.2)
+        ax.axvline(DECLARACAO, color=PRETO, lw=1)
+        for _, r in trocas.iterrows():
+            ax.axvline(r.t, color=VERMELHO if r.lula > r.flavio else AZUL, lw=1, ls="--", alpha=0.7)
+
+    # --- anotações
+    a1.text(FIM_VOTACAO + timedelta(minutes=3), a1.get_ylim()[0] + 1, "17h–19h: votação prorrogada,\ndivulgação suspensa",
+            fontsize=8, color=CINZA, va="bottom")
+    a1.text(DECLARACAO, a1.get_ylim()[1], " TSE declara\n Lula eleito\n (21h10)", va="top", fontsize=8,
+            color=PRETO, bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.95))
+    t19 = RETOMADA + timedelta(minutes=1)
+    if (mk.t == t19).any():
+        a1.annotate("19h: divulgação retomada\ne abertura do CME Globex\n(18h em Nova York)",
+                    xy=(t19, mk.loc[mk.t == t19, "ret"].iloc[0]),
+                    xytext=(datetime(2026, 10, 25, 17, 25, tzinfo=BRT), -14), textcoords="data",
+                    fontsize=8, color=CINZA, arrowprops=dict(arrowstyle="-", color=CINZA, lw=0.7))
+    t21 = datetime(2026, 10, 25, 21, 1, tzinfo=BRT)
+    if (mk.t == t21).any():
+        txt = "21h = 00h UTC (Tóquio,\nfunding da Bybit)"
+        if poly is not None:
+            txt += f"\nP(Lula) já em {100 * poly[poly.index <= t21].iloc[-1]:.0f}%"
+        a1.annotate(txt, (t21, mk.loc[mk.t == t21, "ret"].iloc[0]),
+                    xytext=(datetime(2026, 10, 25, 21, 35, tzinfo=BRT), -15), textcoords="data",
+                    fontsize=8, color=CINZA, ha="left", zorder=5,
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.95),
+                    arrowprops=dict(arrowstyle="-", color=CINZA, lw=0.7))
+    for _, r in trocas.iterrows():
+        lula_lidera = r.lula > r.flavio
+        a2.text(r.t + timedelta(minutes=1.5), 46.5 if lula_lidera else 54,
+                f"{'Lula' if lula_lidera else 'Flávio'} assume {r.t:%Hh%M}\n({r.pct_urnas:.0f}% apuradas)",
+                ha="left", va="center", fontsize=8, color=VERMELHO if lula_lidera else AZUL,
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.9))
+
+    a2.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=BRT))
+    a2.set_xlim(INICIO, FIM)
+    a2.set_xlabel("Horário de Brasília")
+    fig.text(0.01, 0.005, "Fontes: Bybit (perpétuo EWZUSDT), Polymarket e Kalshi (APIs públicas, 1 min); parciais do TSE "
+             "publicadas por InfoMoney e Bloomberg Línea.\nHorários no fim de cada minuto. Domingo: B3 e NYSE fechadas.",
+             fontsize=7.5, color=CINZA)
+    fig.savefig(saida, dpi=200, bbox_inches="tight")
+    print("salvo em", saida)
+
+
 if __name__ == "__main__":
     if "--demo" in sys.argv:
         mk, ap = dados_demo()
@@ -245,3 +372,6 @@ if __name__ == "__main__":
     mk.to_csv("ewz_bybit_1min.csv", index=False)
     ap.to_csv("apuracao_serie.csv", index=False)
     grafico(mk, ap)
+    prev = carregar_previsao()   # se houver polymarket_1min.csv / kalshi_1min.csv na pasta
+    if prev:
+        grafico3(mk, ap, prev)
